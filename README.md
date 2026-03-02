@@ -1,4 +1,4 @@
-# CPP-Optimized Peptide Binder Evolution
+# OptiCPP
 
 A computational framework for evolving cell-penetrating peptides (CPPs) from known protein binders while preserving binding affinity through constrained evolutionary optimization with machine learning guidance.
 
