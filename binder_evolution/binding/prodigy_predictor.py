@@ -16,7 +16,6 @@ Install: pip install prodigy-prot
 from __future__ import annotations
 
 import json
-import math
 import logging
 from pathlib import Path
 from typing import Callable, Optional
@@ -29,23 +28,13 @@ _ProdigyResult = tuple[float, float]  # (kd_M, dg_kcal_per_mol)
 
 class ProdigyBindingPredictor:
     """
-    Binding affinity predictor that uses PRODIGY to compute Kd from a
+    Binding affinity predictor that uses PRODIGY to compute ΔG from a
     protein–peptide complex PDB/CIF structure.
 
     Because PRODIGY requires a 3D structure, complex generation is delegated
-    to a user-supplied callable (``structure_fn``). A reference Kd is
-    established from the seed complex on the first call and is used to
-    normalise all variant scores to [0, 1].
-
-    Score normalisation (log10 scale):
-        score = 1.0 − (log10(Kd_variant) − log10(Kd_reference)) / score_window
-        clamped to [0, 1].
-
-    This means:
-        - variant Kd == reference Kd  →  score 1.0
-        - variant Kd 10× weaker       →  score 0.5  (score_window=2)
-        - variant Kd 100× weaker      →  score 0.0  (score_window=2)
-        - variant Kd stronger         →  score capped at 1.0
+    to a user-supplied callable (``structure_fn``). ``predict_binding`` returns
+    the raw ΔG (kcal/mol) directly; more negative values indicate stronger
+    binding.
 
     Args:
         structure_fn:
@@ -68,13 +57,6 @@ class ProdigyBindingPredictor:
         acc_threshold:
             Minimum fractional SASA for a residue to be counted as
             surface-exposed (default 0.05).
-        score_window:
-            Number of log10 Kd units over which the score decreases from
-            1.0 to 0.0 (default 2.0, i.e. two orders of magnitude).
-        reference_kd:
-            If provided, skip the automatic reference computation and use
-            this Kd (M) value directly. Useful when the seed complex
-            structure is not available up-front.
     """
 
     def __init__(
@@ -86,8 +68,6 @@ class ProdigyBindingPredictor:
         temperature: float = 25.0,
         distance_cutoff: float = 5.5,
         acc_threshold: float = 0.05,
-        score_window: float = 2.0,
-        reference_kd: Optional[float] = None,
     ) -> None:
         self.structure_fn = structure_fn
         self.target_pdb = target_pdb
@@ -100,8 +80,6 @@ class ProdigyBindingPredictor:
         self.temperature = temperature
         self.distance_cutoff = distance_cutoff
         self.acc_threshold = acc_threshold
-        self.score_window = score_window
-        self.reference_kd: Optional[float] = reference_kd
 
         # In-memory cache: sequence → (kd, dg).  Both values are stored so
         # predict_kd and predict_dg never run PRODIGY twice for the same sequence.
@@ -111,34 +89,26 @@ class ProdigyBindingPredictor:
     # Public interface (matches EvolutionController expectations)
     # ------------------------------------------------------------------
 
-    def predict_binding(self, sequence: str) -> float:
+    def predict_binding(self, sequence: str) -> Optional[float]:
         """
-        Return a binding score in [0, 1] for *sequence*.
+        Return the predicted ΔG (kcal/mol) for *sequence*, or None on failure.
 
-        On the very first call the result is stored as the reference Kd
-        (score == 1.0). Subsequent variants are scored relative to it.
+        More negative values indicate stronger binding.
 
         Args:
             sequence: Amino-acid sequence of the peptide (single-letter code).
 
         Returns:
-            Binding score in [0, 1]; 1.0 means at least as good as the
-            reference, 0.0 means ``score_window`` log-units weaker.
-
-        Raises:
-            RuntimeError: If PRODIGY is not installed.
+            ΔG in kcal/mol (negative = favourable binding), or None if
+            PRODIGY failed or is not installed.
         """
         result = self._get_result(sequence)
         if result is None:
-            log.warning("PRODIGY prediction failed for %s – returning score 0.0", sequence)
-            return 0.0
+            log.warning("PRODIGY prediction failed for %s – returning None", sequence)
+            return None
 
-        kd, _ = result
-        if self.reference_kd is None:
-            self.reference_kd = kd
-            log.info("Reference Kd set to %.3e M (sequence: %s)", kd, sequence)
-
-        return self._kd_to_score(kd)
+        _, dg = result
+        return dg
 
     def predict_kd(self, sequence: str) -> Optional[float]:
         """Return the raw predicted Kd (M) for *sequence*, or None on failure."""
@@ -275,26 +245,6 @@ class ProdigyBindingPredictor:
             cache_file.write_text(json.dumps({"kd": result[0], "dg": result[1]}))
         except Exception:
             log.warning("Could not write PRODIGY disk cache: %s", cache_file)
-
-    # ------------------------------------------------------------------
-    # Score conversion
-    # ------------------------------------------------------------------
-
-    def _kd_to_score(self, kd: float) -> float:
-        """
-        Convert a Kd (M) to a normalised binding score in [0, 1].
-
-        Uses a log10-linear scale relative to ``self.reference_kd``.
-        A variant ``score_window`` log-units weaker than the reference
-        receives score 0.0; equal or stronger receives 1.0.
-        """
-        if self.reference_kd is None:
-            raise RuntimeError("reference_kd not set – call predict_binding with the seed first.")
-
-        log_kd = math.log10(kd)
-        log_ref = math.log10(self.reference_kd)
-        score = 1.0 - (log_kd - log_ref) / self.score_window
-        return max(0.0, min(1.0, score))
 
 
 # ---------------------------------------------------------------------------

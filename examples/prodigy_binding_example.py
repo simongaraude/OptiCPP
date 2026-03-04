@@ -4,8 +4,8 @@ Example: use PRODIGY + Boltz as the binding affinity predictor in OptiCPP.
 Two scenarios are shown:
 
   1. StaticProdigyBindingPredictor  – you already have a complex PDB/CIF (e.g.
-     from the RCSB PDB or a previous docking run).  PRODIGY is run once to
-     establish the reference Kd.
+     from the RCSB PDB or a previous docking run).  PRODIGY is run once on the
+     fixed complex.
 
   2. BoltzStructurePredictor + ProdigyBindingPredictor  – Boltz generates a
      fresh complex CIF for every peptide variant; PRODIGY scores each one.
@@ -48,7 +48,7 @@ def scenario_boltz(receptor_sequence: str, seed_peptide: str):
 
     Args:
         receptor_sequence: Full amino-acid sequence of the target protein.
-        seed_peptide:      Seed CPP sequence (establishes reference Kd).
+        seed_peptide:      Seed CPP sequence.
     """
     from binder_evolution.binding.prodigy_predictor import ProdigyBindingPredictor
     from binder_evolution.structure.boltz_predictor import BoltzStructurePredictor
@@ -69,13 +69,11 @@ def scenario_boltz(receptor_sequence: str, seed_peptide: str):
         peptide_chains="B",
         temperature=25.0,
         distance_cutoff=5.5,
-        score_window=2.0,          # 2 log10 units → score 1→0
     )
 
-    # Seed call establishes reference_kd
-    seed_score = predictor.predict_binding(seed_peptide)
+    seed_dg = predictor.predict_binding(seed_peptide)
     print(f"Seed peptide : {seed_peptide}")
-    print(f"Reference Kd : {predictor.reference_kd:.3e} M  (score {seed_score:.3f})")
+    print(f"Seed ΔG      : {seed_dg:.2f} kcal/mol")
 
     # Plug into EvolutionController
     # from binder_evolution.config import EvolutionConfig
@@ -108,19 +106,20 @@ if __name__ == "__main__":
         peptide_chains="B",
     )
 
-    kd_map = {
-        "SQETFSDLWKLLPEN": 1e-7,   # reference: 100 nM  → score 1.000
-        "RQRTFRDLWKRLPKN": 1e-7,   # same Kd            → score 1.000
-        "RQRTFADLWKALPKN": 5e-7,   # ~5× weaker         → score 0.651
-        "AAAAAAAAAAAAAAAA": 1e-5,   # 100× weaker        → score 0.000
+    dg_map = {
+        "SQETFSDLWKLLPEN": -9.5,   # strong binder
+        "RQRTFRDLWKRLPKN": -9.5,   # same ΔG
+        "RQRTFADLWKALPKN": -8.2,   # weaker binder
+        "AAAAAAAAAAAAAAAA": -4.0,  # very weak binder
     }
 
-    seed = next(iter(kd_map))
-    predictor._kd_cache = kd_map.copy()
-    predictor.reference_kd = kd_map[seed]
+    # Inject fake results directly into the in-memory cache
+    predictor._result_cache = {
+        seq: (0.0, dg) for seq, dg in dg_map.items()
+    }
 
-    print(f"{'Sequence':<25} {'Kd (M)':>12} {'Score':>8}")
-    print("-" * 48)
-    for seq, kd in kd_map.items():
-        score = predictor._kd_to_score(kd)
-        print(f"{seq:<25} {kd:>12.2e} {score:>8.3f}")
+    print(f"{'Sequence':<25} {'ΔG (kcal/mol)':>14}")
+    print("-" * 42)
+    for seq in dg_map:
+        dg = predictor.predict_binding(seq)
+        print(f"{seq:<25} {dg:>14.2f}")
