@@ -30,8 +30,8 @@ This system addresses a critical challenge in peptide therapeutics: converting p
 
 ### Binding Preservation
 - **Hotspot protection**: Critical binding residues identified and protected from mutation
-- **Binding constraint**: Variants exceeding 20% binding loss automatically rejected
-- **Multi-objective fitness**: Weighted combination (60% binding, 40% CPP)
+- **Binding constraint**: Variants exceeding 20% binding loss (ΔG increase) automatically rejected
+- **Multi-objective fitness**: Weighted combination of binding affinity (ΔG, kcal/mol) and CPP score
 
 ### Structural Validation (Optional)
 - **Structure prediction**: Integration with AlphaFold2/Boltz for complex prediction
@@ -172,10 +172,10 @@ best_peptide, population, history = controller.run(
 - Filter out incorrectly binding variants
 
 ### Step 4: Fitness Evaluation
-- Predict binding affinity for each variant
+- Predict binding affinity for each variant (raw ΔG in kcal/mol from PRODIGY)
 - Predict CPP probability using ML model
-- Calculate fitness: 0.6 × binding + 0.4 × CPP
-- Apply binding constraint (max 20% loss)
+- Apply binding constraint (max 20% ΔG increase vs seed)
+- Calculate weighted fitness from ΔG and CPP score
 
 ### Step 5: Parent Selection
 - Tournament selection (default size: 3)
@@ -302,15 +302,15 @@ The framework expects a binding predictor with the following interface:
 
 ```python
 class BindingPredictor:
-    def predict_binding(self, sequence: str) -> float:
+    def predict_binding(self, sequence: str) -> Optional[float]:
         """
         Predict binding affinity.
-        
+
         Args:
             sequence: Amino acid sequence
-            
+
         Returns:
-            Binding score (0-1), higher is better
+            ΔG in kcal/mol (more negative = stronger binding), or None on failure.
         """
         pass
 ```
