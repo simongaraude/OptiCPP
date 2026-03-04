@@ -182,7 +182,7 @@ class ProdigyBindingPredictor:
         try:
             pdb_path = self.structure_fn(sequence, self.target_pdb)
             if pdb_path is None or not Path(pdb_path).exists():
-                log.error("structure_fn returned no valid PDB for sequence %s", sequence)
+                log.error("structure_fn returned no valid structure file for sequence %s", sequence)
                 return None
             return Path(pdb_path)
         except Exception:
@@ -193,10 +193,14 @@ class ProdigyBindingPredictor:
         """
         Run PRODIGY on *complex_pdb* and return (Kd in M, ΔG in kcal/mol).
 
+        Accepts both PDB (``.pdb``) and mmCIF (``.cif``) files.  Boltz
+        produces ``.cif`` output, so mmCIF support is required when using
+        ``BoltzStructurePredictor``.
+
         Returns None if PRODIGY is not installed or prediction fails.
         """
         try:
-            from Bio.PDB import PDBParser  # type: ignore
+            from Bio.PDB import MMCIFParser, PDBParser  # type: ignore
             from prodigy_prot.modules.prodigy import Prodigy  # type: ignore
         except ImportError as exc:
             raise RuntimeError(
@@ -206,7 +210,11 @@ class ProdigyBindingPredictor:
             ) from exc
 
         try:
-            parser = PDBParser(QUIET=True)
+            suffix = Path(complex_pdb).suffix.lower()
+            if suffix in {".cif", ".mmcif"}:
+                parser = MMCIFParser(QUIET=True)
+            else:
+                parser = PDBParser(QUIET=True)
             structure = parser.get_structure("complex", str(complex_pdb))
             model = structure[0]
 

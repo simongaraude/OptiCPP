@@ -1,99 +1,81 @@
 """
-Example: use PRODIGY as the binding affinity predictor in OptiCPP.
+Example: use PRODIGY + Boltz as the binding affinity predictor in OptiCPP.
 
 Two scenarios are shown:
 
-  1. StaticProdigyBindingPredictor  – you already have a complex PDB (e.g.
-     from the PDB, HADDOCK, or a previous docking run).  PRODIGY is run
-     once to establish the reference Kd.  Combine this with StructuralFilter
-     (AlphaFold2/Boltz) to generate per-variant structures and assess them.
+  1. StaticProdigyBindingPredictor  – you already have a complex PDB/CIF (e.g.
+     from the RCSB PDB or a previous docking run).  PRODIGY is run once to
+     establish the reference Kd.
 
-  2. ProdigyBindingPredictor with a custom structure_fn  – you supply a
-     callable that builds a complex PDB for any peptide sequence.  PRODIGY
-     is called for every evaluated variant.
+  2. BoltzStructurePredictor + ProdigyBindingPredictor  – Boltz generates a
+     fresh complex CIF for every peptide variant; PRODIGY scores each one.
+     This is the recommended pipeline for evolutionary optimization.
 
 Requirements:
-    pip install prodigy-prot biopython
+    pip install boltz prodigy-prot biopython
 """
 
 from pathlib import Path
-from typing import Optional
 
 # ---------------------------------------------------------------------------
-# Scenario 1: fixed complex PDB (e.g. 1YCR – MDM2 / p53 peptide from RCSB)
+# Scenario 1: fixed complex (PDB or CIF)
 # ---------------------------------------------------------------------------
 
-def scenario_static(complex_pdb: Path):
-    """Predict Kd from a known complex PDB, then run evolution."""
+def scenario_static(complex_path: Path):
+    """Predict Kd from a known complex PDB/CIF, then run evolution."""
     from binder_evolution.binding.prodigy_predictor import StaticProdigyBindingPredictor
 
     predictor = StaticProdigyBindingPredictor(
-        complex_pdb=complex_pdb,
-        receptor_chains="A",   # MDM2 chain
-        peptide_chains="B",    # p53 peptide chain
+        complex_pdb=complex_path,
+        receptor_chains="A",   # receptor chain ID in the file
+        peptide_chains="B",    # peptide chain ID in the file
         temperature=25.0,
     )
 
-    # Evaluate the fixed complex once to set the reference Kd
     kd, dg = predictor.evaluate_reference()
     print(f"Reference Kd : {kd:.3e} M")
     print(f"Reference ΔG : {dg:.2f} kcal/mol")
-
-    # The predictor is now ready to be passed to EvolutionController.
-    # All variants will receive score 1.0 unless their predicted structures
-    # are evaluated separately (e.g. via StructuralFilter → PRODIGY pipeline).
     return predictor
 
 
 # ---------------------------------------------------------------------------
-# Scenario 2: structure_fn supplies per-variant complex PDBs
+# Scenario 2: Boltz → PRODIGY pipeline (recommended for evolution)
 # ---------------------------------------------------------------------------
 
-def make_structure_fn(target_pdb: Path):
+def scenario_boltz(receptor_sequence: str, seed_peptide: str):
     """
-    Factory that returns a structure_fn compatible with ProdigyBindingPredictor.
-
-    Replace the body of `_predict_complex` with your actual structure
-    prediction tool (HADDOCK, AlphaFold-Multimer, Boltz, RoseTTAFold2, …).
+    Generate per-variant complex structures with Boltz, score with PRODIGY.
 
     Args:
-        target_pdb: PDB of the receptor (fixed across all variants).
-
-    Returns:
-        Callable(sequence, target_pdb) -> Path  pointing to the complex PDB.
+        receptor_sequence: Full amino-acid sequence of the target protein.
+        seed_peptide:      Seed CPP sequence (establishes reference Kd).
     """
-
-    def _predict_complex(sequence: str, target_pdb: Optional[Path]) -> Path:
-        # --- replace this block with a real structure predictor ---
-        # Example stub: write a minimal placeholder PDB so the code runs.
-        import tempfile, textwrap
-        tmp = tempfile.NamedTemporaryFile(suffix=".pdb", delete=False)
-        tmp.write(textwrap.dedent(f"""\
-            REMARK  Stub complex for sequence {sequence}
-            END
-        """).encode())
-        tmp.close()
-        return Path(tmp.name)
-        # ----------------------------------------------------------
-
-    return _predict_complex
-
-
-def scenario_dynamic(target_pdb: Path):
-    """Predict Kd for each variant via a user-supplied structure predictor."""
     from binder_evolution.binding.prodigy_predictor import ProdigyBindingPredictor
+    from binder_evolution.structure.boltz_predictor import BoltzStructurePredictor
 
-    structure_fn = make_structure_fn(target_pdb)
+    boltz = BoltzStructurePredictor(
+        receptor_sequence=receptor_sequence,
+        output_dir=Path("boltz_out"),
+        receptor_chain="A",
+        peptide_chain="B",
+        recycling_steps=3,
+        diffusion_samples=1,
+        use_msa_server=True,   # auto MSA via mmseqs2 (requires internet)
+    )
 
     predictor = ProdigyBindingPredictor(
-        structure_fn=structure_fn,
-        target_pdb=target_pdb,
+        structure_fn=boltz,        # BoltzStructurePredictor is callable
         receptor_chains="A",
         peptide_chains="B",
         temperature=25.0,
         distance_cutoff=5.5,
-        score_window=2.0,   # score drops 0→1 over 2 log10 units of Kd
+        score_window=2.0,          # 2 log10 units → score 1→0
     )
+
+    # Seed call establishes reference_kd
+    seed_score = predictor.predict_binding(seed_peptide)
+    print(f"Seed peptide : {seed_peptide}")
+    print(f"Reference Kd : {predictor.reference_kd:.3e} M  (score {seed_score:.3f})")
 
     # Plug into EvolutionController
     # from binder_evolution.config import EvolutionConfig
@@ -105,24 +87,20 @@ def scenario_dynamic(target_pdb: Path):
     # hotspots = {2, 6, 9}
     #
     # controller = EvolutionController(config, cpp_scorer, predictor, hotspots)
-    # best, pop, history = controller.run("SQETFSDLWKLLPEN", "MDM2")
+    # best, pop, history = controller.run(seed_peptide, "MDM2")
 
     return predictor
 
 
 # ---------------------------------------------------------------------------
-# Quick smoke test (no real structures needed)
+# Quick smoke test (no real Boltz/PRODIGY installation needed)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import math
-
     from binder_evolution.binding.prodigy_predictor import ProdigyBindingPredictor
 
-    # Fake structure_fn that returns a hardcoded Kd via monkey-patching
-    # (demonstrates score normalisation without real PDB files)
-    def fake_structure_fn(sequence: str, target_pdb) -> Path:
-        return Path("/dev/null")   # will be intercepted below
+    def fake_structure_fn(sequence, target_pdb=None):
+        return Path("/dev/null")   # bypassed below
 
     predictor = ProdigyBindingPredictor(
         structure_fn=fake_structure_fn,
@@ -130,22 +108,14 @@ if __name__ == "__main__":
         peptide_chains="B",
     )
 
-    # Override _run_prodigy to return synthetic Kd values
     kd_map = {
-        "SQETFSDLWKLLPEN": 1e-7,   # reference: 100 nM
-        "RQRTFRDLWKRLPKN": 1e-7,   # same Kd → score 1.0
-        "AAAAAAAAAAAAAAAA": 1e-5,   # 100× weaker → score 0.0
-        "RQRTFADLWKALPKN": 5e-7,   # ~5× weaker → score ~0.65
+        "SQETFSDLWKLLPEN": 1e-7,   # reference: 100 nM  → score 1.000
+        "RQRTFRDLWKRLPKN": 1e-7,   # same Kd            → score 1.000
+        "RQRTFADLWKALPKN": 5e-7,   # ~5× weaker         → score 0.651
+        "AAAAAAAAAAAAAAAA": 1e-5,   # 100× weaker        → score 0.000
     }
 
-    def fake_run_prodigy(pdb):
-        # Retrieve which sequence we are scoring (last call's sequence)
-        return None  # intentionally return None; we'll call predict_kd below
-
-    sequences = list(kd_map.keys())
-    seed = sequences[0]
-
-    # Manually inject cached Kd values to bypass structure/PRODIGY calls
+    seed = next(iter(kd_map))
     predictor._kd_cache = kd_map.copy()
     predictor.reference_kd = kd_map[seed]
 
