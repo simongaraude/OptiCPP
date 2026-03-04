@@ -18,6 +18,8 @@ Typical usage::
         receptor_sequence="MPRFM...",   # full receptor AA sequence
         output_dir=Path("boltz_out"),
         use_msa_server=True,            # auto-generate MSAs via mmseqs2
+        diffusion_samples=5,            # predict 5 structures, use the best
+        min_iptm=0.6,                   # discard poorly modelled complexes
     )
 
     predictor = ProdigyBindingPredictor(
@@ -30,9 +32,9 @@ Typical usage::
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import subprocess
-import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -55,6 +57,14 @@ class BoltzStructurePredictor:
     already exists for a sequence hash it is returned immediately without
     re-running Boltz.
 
+    When ``diffusion_samples > 1``, Boltz produces multiple candidate
+    structures.  This class reads the per-model confidence JSON that Boltz
+    writes alongside each CIF and returns the model with the highest ipTM
+    (interface pTM) score — the standard quality metric for predicted
+    protein–protein complexes.  Models whose ipTM falls below ``min_iptm``
+    are rejected entirely (returns ``None``), signalling to the downstream
+    PRODIGY predictor that the variant should receive a score of 0.
+
     Args:
         receptor_sequence:
             Single-letter amino-acid sequence of the receptor protein.
@@ -67,10 +77,14 @@ class BoltzStructurePredictor:
         recycling_steps:
             Number of recycling steps passed to Boltz (default 3).
         diffusion_samples:
-            Number of diffusion samples; only the top-ranked model is used
-            (default 1).
+            Number of diffusion samples to generate per sequence.  The model
+            with the highest ipTM is selected (default 1).
         sampling_steps:
             Number of diffusion sampling steps (default 200).
+        min_iptm:
+            Minimum acceptable ipTM for a predicted complex.  Structures below
+            this threshold are treated as prediction failures and ``None`` is
+            returned (default 0.5).  Set to 0.0 to disable the filter.
         use_msa_server:
             If True, pass ``--use_msa_server`` to Boltz so that MSAs are
             generated automatically via mmseqs2.  Requires internet access
@@ -94,6 +108,7 @@ class BoltzStructurePredictor:
         recycling_steps: int = 3,
         diffusion_samples: int = 1,
         sampling_steps: int = 200,
+        min_iptm: float = 0.5,
         use_msa_server: bool = False,
         use_potentials: bool = False,
         boltz_cmd: str = "boltz",
@@ -106,6 +121,7 @@ class BoltzStructurePredictor:
         self.recycling_steps = recycling_steps
         self.diffusion_samples = diffusion_samples
         self.sampling_steps = sampling_steps
+        self.min_iptm = min_iptm
         self.use_msa_server = use_msa_server
         self.use_potentials = use_potentials
         self.boltz_cmd = boltz_cmd
@@ -121,33 +137,27 @@ class BoltzStructurePredictor:
         self, sequence: str, target_pdb: Optional[Path] = None
     ) -> Optional[Path]:
         """
-        Generate (or retrieve from cache) the complex CIF for *sequence*.
+        Generate (or retrieve from cache) the best-ranked complex CIF for
+        *sequence*.
 
         Args:
             sequence:   Peptide amino-acid sequence (single-letter code).
             target_pdb: Ignored; receptor is taken from ``receptor_sequence``.
 
         Returns:
-            Path to the predicted complex ``.cif`` file, or ``None`` on failure.
+            Path to the best-ranked ``.cif`` file whose ipTM ≥ ``min_iptm``,
+            or ``None`` if Boltz fails or all models fall below the threshold.
         """
         sequence = sequence.strip().upper()
         job_name = self._job_name(sequence)
-        cif_path = self._expected_cif(job_name)
 
-        if cif_path.exists():
-            log.debug("Cache hit for %s → %s", sequence, cif_path)
-            return cif_path
+        # Only re-run Boltz if model_0 (the minimum output) is absent
+        if not self._cif_path(job_name, 0).exists():
+            yaml_path = self._write_yaml(sequence, job_name)
+            if not self._run_boltz(yaml_path, job_name):
+                return None
 
-        yaml_path = self._write_yaml(sequence, job_name)
-        success = self._run_boltz(yaml_path, job_name)
-        if not success:
-            return None
-
-        if not cif_path.exists():
-            log.error("Boltz finished but expected CIF not found: %s", cif_path)
-            return None
-
-        return cif_path
+        return self._best_model(job_name)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -155,15 +165,93 @@ class BoltzStructurePredictor:
 
     def _job_name(self, sequence: str) -> str:
         """Stable, filesystem-safe identifier for *sequence*."""
-        digest = hashlib.sha1(sequence.encode()).hexdigest()[:10]
+        digest = hashlib.sha256(sequence.encode()).hexdigest()[:12]
         return f"complex_{digest}"
 
-    def _expected_cif(self, job_name: str) -> Path:
+    def _cif_path(self, job_name: str, model_idx: int) -> Path:
         """
-        Boltz writes the top-ranked model to:
-            <output_dir>/predictions/<job_name>/<job_name>_model_0.cif
+        Boltz writes each model to:
+            <output_dir>/predictions/<job_name>/<job_name>_model_<i>.cif
         """
-        return self.output_dir / "predictions" / job_name / f"{job_name}_model_0.cif"
+        return (
+            self.output_dir
+            / "predictions"
+            / job_name
+            / f"{job_name}_model_{model_idx}.cif"
+        )
+
+    def _confidence_path(self, job_name: str, model_idx: int) -> Path:
+        """
+        Boltz writes per-model confidence to:
+            <output_dir>/predictions/<job_name>/confidence_<job_name>_model_<i>.json
+        """
+        return (
+            self.output_dir
+            / "predictions"
+            / job_name
+            / f"confidence_{job_name}_model_{model_idx}.json"
+        )
+
+    def _read_iptm(self, job_name: str, model_idx: int) -> Optional[float]:
+        """
+        Return the ipTM score for *model_idx*, or None if the file is missing
+        or malformed.
+        """
+        conf_path = self._confidence_path(job_name, model_idx)
+        if not conf_path.exists():
+            log.warning("Confidence file not found: %s", conf_path)
+            return None
+        try:
+            data = json.loads(conf_path.read_text())
+            return float(data["iptm"])
+        except Exception:
+            log.warning("Could not read ipTM from %s", conf_path)
+            return None
+
+    def _best_model(self, job_name: str) -> Optional[Path]:
+        """
+        Select the model with the highest ipTM from all generated samples.
+
+        Returns the CIF path of the winner, or None if no model meets
+        ``min_iptm``.
+        """
+        best_cif: Optional[Path] = None
+        best_iptm: float = -1.0
+
+        for i in range(self.diffusion_samples):
+            cif = self._cif_path(job_name, i)
+            if not cif.exists():
+                continue  # Boltz may produce fewer models than requested
+
+            iptm = self._read_iptm(job_name, i)
+            if iptm is None:
+                continue
+
+            log.debug("Model %d: ipTM=%.3f (%s)", i, iptm, cif.name)
+            if iptm > best_iptm:
+                best_iptm = iptm
+                best_cif = cif
+
+        if best_cif is None:
+            log.error("No valid Boltz models found for job %s", job_name)
+            return None
+
+        if best_iptm < self.min_iptm:
+            log.warning(
+                "Best ipTM %.3f < threshold %.3f for job %s — rejecting complex",
+                best_iptm,
+                self.min_iptm,
+                job_name,
+            )
+            return None
+
+        log.info(
+            "Selected model %s (ipTM=%.3f) for job %s",
+            best_cif.name,
+            best_iptm,
+            job_name,
+        )
+        return best_cif
 
     def _write_yaml(self, sequence: str, job_name: str) -> Path:
         """Write the Boltz input YAML and return its path."""
@@ -232,7 +320,7 @@ class BoltzStructurePredictor:
                 result.returncode,
                 elapsed,
                 job_name,
-                result.stderr[-2000:],  # last 2 KB
+                result.stderr[-2000:],
             )
             return False
 
